@@ -15,7 +15,7 @@ from infrastructure.shared.models.text import TextModel, reasoning_arguments
 from infrastructure.shared.models.vision import VisualModel
 from infrastructure.utils.presentation.console import DemoConsole, preview, show_panel, display_width, WaitingStatus
 from infrastructure.utils.presentation.logging import console_log
-from infrastructure.utils.presentation.model_io import _http_request, _http_response, _input_summary, _usage_summary, invoke
+from infrastructure.utils.presentation.model_io import _http_request, _http_response, _input_summary, _stream_text, _usage_summary, invoke
 
 
 class ConsoleLogging(unittest.TestCase):
@@ -37,6 +37,23 @@ class ConsoleLogging(unittest.TestCase):
         return {"id": "chat-test", "object": "chat.completion", "created": 0, "model": "test-model",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}
+
+    def stream(self, body, finish=True):
+        """Serve a completion as server-sent events split into several deltas."""
+        envelope = {key: body[key] for key in ("id", "created", "model")} | {"object": "chat.completion.chunk"}
+        choice = body["choices"][0]
+        content, message = choice["message"]["content"], choice["message"]
+        middle = len(content) // 2
+        deltas = [{"role": "assistant", "content": ""}]
+        if message.get("reasoning_content"):
+            deltas.append({"reasoning_content": message["reasoning_content"]})
+        deltas += [{"content": content[:middle]}, {"content": content[middle:]}]
+        chunks = [{**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]} for delta in deltas]
+        if finish:
+            chunks.append({**envelope, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]})
+        chunks.append({**envelope, "choices": [], "usage": body["usage"]})
+        events = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=events.encode())
 
     def test_text_and_visual_clients_ignore_environment_proxies_and_keep_audit_hooks(self):
         with patch.dict("os.environ", {
@@ -76,10 +93,35 @@ class ConsoleLogging(unittest.TestCase):
             self.assertEqual(record["error_type"], "APIConnectionError")
             self.assertIn("ConnectError: TLS connection closed by peer", record["cause"])
 
+    def test_streamed_deltas_form_one_complete_logged_response(self):
+        body = self.response('{"ok":true,"items":[1,2]}')
+        body["choices"][0]["message"]["reasoning_content"] = "Think first."
+        body["usage"]["completion_tokens_details"] = {"reasoning_tokens": 3}
+        model = self.model(lambda request: self.stream(body))
+        with TemporaryDirectory() as temporary, redirect_stdout(StringIO()):
+            root = Path(temporary)
+            with console_log(root):
+                self.assertEqual(model.generate_json("Generate.", {}), {"ok": True, "items": [1, 2]})
+            records = [json.loads(line) for line in (root / "model_calls.jsonl").read_text().splitlines()]
+        message = records[-1]["response"]["choices"][0]
+        self.assertEqual(message["finish_reason"], "stop")
+        self.assertEqual(message["message"]["content"], '{"ok":true,"items":[1,2]}')
+        self.assertEqual(message["message"]["reasoning_content"], "Think first.")
+        self.assertEqual(records[-1]["response"]["usage"]["completion_tokens_details"]["reasoning_tokens"], 3)
+        self.assertEqual(records[-1]["response"]["object"], "chat.completion")
+
+    def test_stream_without_finish_reason_is_a_failed_call(self):
+        model = self.model(lambda request: self.stream(self.response('{"ok":'), finish=False))
+        with TemporaryDirectory() as temporary, redirect_stdout(StringIO()):
+            root = Path(temporary)
+            with console_log(root), self.assertRaisesRegex(ValueError, "before a finish_reason"):
+                model.generate_json("Generate.", {})
+            self.assertEqual(json.loads((root / "model_calls.jsonl").read_text().splitlines()[-1])["event"], "error")
+
     def test_console_is_bounded_but_panels_and_model_io_are_complete(self):
         source = "export const answer = 42;\n" * 1000 + "END-OF-SOURCE"
         raw_content = json.dumps({"edits": [{"path": "frontend/src/page.tsx", "content": source}]})
-        model = self.model(lambda request: httpx.Response(200, json=self.response(raw_content)))
+        model = self.model(lambda request: self.stream(self.response(raw_content)))
         terminal = StringIO()
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -109,7 +151,8 @@ class ConsoleLogging(unittest.TestCase):
         wire_request = json.loads(records[1]["body"])
         self.assertEqual(wire_request, records[0]["arguments"])
         self.assertTrue(wire_request["messages"][0]["content"].endswith("Return exactly one JSON object without Markdown."))
-        self.assertEqual(json.loads(records[2]["body"])["choices"][0]["message"]["content"], raw_content)
+        self.assertTrue(wire_request["stream"])
+        self.assertEqual(_stream_text(records[2]["body"]), raw_content)
         self.assertEqual(records[3]["response"]["choices"][0]["message"]["content"], raw_content)
         self.assertEqual(len({record["call_id"] for record in records}), 1)
         self.assertNotIn("test-secret", json.dumps(records))
@@ -123,7 +166,7 @@ class ConsoleLogging(unittest.TestCase):
                 return httpx.Response(500, headers={"retry-after-ms": "1"}, json={"error": {"message": "Temporary failure"}})
             if "max_completion_tokens" in body:
                 return httpx.Response(400, json={"error": {"message": "Unsupported parameter max_completion_tokens"}})
-            return httpx.Response(200, json=self.response('{"ok":true}'))
+            return self.stream(self.response('{"ok":true}'))
         model = self.model(handler)
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -142,8 +185,10 @@ class ConsoleLogging(unittest.TestCase):
                 input_file = next(directory.glob(f"06.*.{call_id[:8]}.{attempt}.model.input"))
                 output_file = input_file.with_name(input_file.name.removesuffix(".input") + ".ouput")
                 self.assertEqual(input_file.read_text(), "Generate.\nKeep line breaks.\nReturn exactly one JSON object without Markdown.\n\n{}")
-                body = json.loads(response_record["body"])
-                expected = body["error"]["message"] if "error" in body else body["choices"][0]["message"]["content"]
+                if response_record["status_code"] == 200:
+                    expected = _stream_text(response_record["body"])
+                else:
+                    expected = json.loads(response_record["body"])["error"]["message"]
                 self.assertEqual(output_file.read_text(), expected)
                 self.assertNotIn("test-secret", input_file.read_text())
         requests = [json.loads(record["body"]) for record in records if record["event"] == "http_request"]
@@ -165,7 +210,7 @@ class ConsoleLogging(unittest.TestCase):
         attempts = []
         def handler(request):
             attempts.append(json.loads(request.content))
-            return httpx.Response(200, json=self.response('{"ok":true}'))
+            return self.stream(self.response('{"ok":true}'))
         model = self.model(handler)
         model.name = "deepseek-flash"
         with redirect_stdout(StringIO()):
@@ -186,7 +231,7 @@ class ConsoleLogging(unittest.TestCase):
                 attempts.append(body)
                 if "thinking" in body or "reasoning_effort" in body:
                     return httpx.Response(400, json={"error": {"message": "Unsupported parameter thinking"}})
-                return httpx.Response(200, json=self.response('{"ok":true}'))
+                return self.stream(self.response('{"ok":true}'))
             model = self.model(handler)
             if visual:
                 visual_model = VisualModel.__new__(VisualModel)
@@ -206,7 +251,7 @@ class ConsoleLogging(unittest.TestCase):
     def test_invalid_and_truncated_content_is_logged_before_parsing(self):
         for content, finish in [("{broken-json", "stop"), ('{"partial":', "length")]:
             with self.subTest(finish=finish), TemporaryDirectory() as temporary:
-                model = self.model(lambda request: httpx.Response(200, json=self.response(content, finish)))
+                model = self.model(lambda request: self.stream(self.response(content, finish)))
                 root = Path(temporary)
                 with redirect_stdout(StringIO()), console_log(root), self.assertRaises(ValueError):
                     model.generate_json("Generate.", {})
@@ -219,7 +264,7 @@ class ConsoleLogging(unittest.TestCase):
         def handler(request):
             attempts.append(json.loads(request.content))
             content = json.dumps(EXAMPLE) if len(attempts) == 1 else '```json\n{}\n```'
-            return httpx.Response(200, json=self.response(content))
+            return self.stream(self.response(content))
         model = self.model(handler)
         model.json_mode = False
         with redirect_stdout(StringIO()):
@@ -230,7 +275,7 @@ class ConsoleLogging(unittest.TestCase):
         self.assertIn("Return exactly one JSON object without Markdown", attempts[0]["messages"][0]["content"])
 
     def test_length_feedback_explains_output_budget_instead_of_attempting_to_parse_partial_code(self):
-        model = self.model(lambda request: httpx.Response(200, json=self.response('{"edits":[', finish="length")))
+        model = self.model(lambda request: self.stream(self.response('{"edits":[', finish="length")))
         model.max_output_tokens = 320000
         with redirect_stdout(StringIO()), self.assertRaisesRegex(ValueError, r"finish_reason=length.*320000 tokens including reasoning"):
             model.generate_json("Implement", {"task": {}})
@@ -242,7 +287,7 @@ class ConsoleLogging(unittest.TestCase):
         requests = []
         def handler(request):
             requests.append(json.loads(request.content))
-            return httpx.Response(200, json=self.response(json.dumps({"edits": edits})))
+            return self.stream(self.response(json.dumps({"edits": edits})))
         model = self.model(handler)
         with redirect_stdout(StringIO()):
             result = model.generate_json("Implement all required files", {"task": {}, "files": files})
@@ -250,7 +295,7 @@ class ConsoleLogging(unittest.TestCase):
         self.assertEqual(result["edits"], edits)
 
     def test_image_data_is_full_in_logs_and_absent_from_terminal(self):
-        model = self.model(lambda request: httpx.Response(200, json=self.response('{"layout":"visible"}')))
+        model = self.model(lambda request: self.stream(self.response('{"layout":"visible"}')))
         image_data = "data:image/png;base64," + "QUJD" * 2000
         arguments = {"model": model.name, "messages": [{"role": "user", "content": [
             {"type": "text", "text": "Analyze visible evidence."},
@@ -263,11 +308,12 @@ class ConsoleLogging(unittest.TestCase):
                 invoke(model.client, arguments)
             records = [json.loads(line) for line in (root / "model_calls.jsonl").read_text().splitlines()]
         self.assertNotIn("QUJD", terminal.getvalue())
-        self.assertEqual(json.loads(records[1]["body"]), arguments)
+        self.assertEqual(json.loads(records[1]["body"]),
+            {**arguments, "stream": True, "stream_options": {"include_usage": True}})
 
     def test_disabled_model_logging_keeps_usage_without_dumping_prompts_or_responses(self):
         marker = "PRIVATE-MODEL-OUTPUT"
-        model = self.model(lambda request: httpx.Response(200, json=self.response(json.dumps({"secret": marker}))))
+        model = self.model(lambda request: self.stream(self.response(json.dumps({"secret": marker}))))
         terminal = StringIO()
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -303,7 +349,7 @@ class ConsoleLogging(unittest.TestCase):
             with self.subTest(extra=extra), TemporaryDirectory() as temporary:
                 body = self.response('{"ok":true}')
                 body["usage"].update(extra)
-                model = self.model(lambda request: httpx.Response(200, json=body))
+                model = self.model(lambda request: self.stream(body))
                 terminal = StringIO()
                 root = Path(temporary)
                 with redirect_stdout(terminal), console_log(root):
@@ -344,7 +390,7 @@ class ConsoleLogging(unittest.TestCase):
         self.assertNotIn("\x1b[", terminal.getvalue())
 
     def test_redirected_waiting_message_is_printed_only_once(self):
-        model = self.model(lambda request: httpx.Response(200, json=self.response('{"ok":true}')))
+        model = self.model(lambda request: self.stream(self.response('{"ok":true}')))
         terminal = StringIO()
         with redirect_stdout(terminal):
             invoke(model.client, {"model": model.name, "messages": [{"role": "user", "content": "Generate."}]})

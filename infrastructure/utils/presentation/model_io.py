@@ -9,6 +9,7 @@ from uuid import uuid4
 from contextvars import ContextVar
 
 import httpx
+from openai.types.chat import ChatCompletion
 
 from infrastructure.utils.presentation.console import current_activity, preview, show_panel, WaitingStatus
 from infrastructure.utils.presentation.logging import session_info, full_detail
@@ -77,17 +78,34 @@ def _http_request(request: httpx.Request) -> None:
         body=request.content.decode("utf-8"))
 
 
+def _stream_text(body: str) -> str:
+    """Join streamed content deltas from a server-sent event body."""
+    parts = []
+    for line in body.splitlines():
+        if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(line[5:])
+        except ValueError:
+            continue
+        for choice in chunk.get("choices") or []:
+            parts.append((choice.get("delta") or {}).get("content") or "")
+    return "".join(parts)
+
+
 def _http_response(response: httpx.Response) -> None:
-    """Read and retain the complete non-streaming response before SDK parsing."""
+    """Read and retain the complete response, streamed or not, before SDK parsing."""
     response.read()
     prefix = response.request.extensions.get("compiler_model_log_prefix")
     if prefix is not None:
         try:
-            body = response.json()
+            body = None if "event-stream" in response.headers.get("content-type", "") else response.json()
         except ValueError:
             text = response.text
         else:
-            if isinstance(body, dict) and "choices" in body:
+            if body is None:
+                text = _stream_text(response.text)
+            elif isinstance(body, dict) and "choices" in body:
                 text = "\n\n".join(_message_text(choice.get("message", {})) for choice in body["choices"])
             elif isinstance(body, dict) and isinstance(body.get("error"), dict):
                 text = str(body["error"].get("message", ""))
@@ -268,8 +286,38 @@ def show_call_totals():
     show_panel("Stage model usage | reported counts only", view, tone="output")
 
 
+def _stream_completion(stream) -> ChatCompletion:
+    """Assemble streamed deltas into the non-streaming completion callers expect."""
+    envelope, choices, usage = {}, {}, None
+    for chunk in stream:
+        if not envelope:
+            envelope = {"id": chunk.id, "created": chunk.created, "model": chunk.model,
+                "system_fingerprint": chunk.system_fingerprint}
+        if chunk.usage:
+            usage = chunk.usage.model_dump(mode="json")
+        for choice in chunk.choices:
+            item = choices.setdefault(choice.index, {"index": choice.index, "finish_reason": None,
+                "message": {"role": "assistant", "content": ""}})
+            # Provider extras such as reasoning_content are concatenated like content.
+            for key, value in choice.delta.model_dump(mode="json", exclude_none=True).items():
+                if isinstance(value, str) and key != "role":
+                    item["message"][key] = item["message"].get(key, "") + value
+            if choice.finish_reason:
+                item["finish_reason"] = choice.finish_reason
+    unfinished = [index for index, item in choices.items() if item["finish_reason"] is None]
+    if not choices or unfinished:
+        raise ValueError("Model stream ended before a finish_reason was received")
+    return ChatCompletion.model_validate({**envelope, "object": "chat.completion",
+        "choices": [choices[index] for index in sorted(choices)], "usage": usage})
+
+
 def invoke(client, arguments: dict):
-    """Audit one SDK call and show a static waiting message until it returns."""
+    """Audit one SDK call and show a static waiting message until it returns.
+
+    Responses are streamed so that the gateway keeps receiving data during long
+    generations; non-streaming attempts were cut off after roughly 35 seconds.
+    """
+    arguments = {**arguments, "stream": True, "stream_options": {"include_usage": True}}
     call_id = uuid4().hex
     activity = current_activity()
     session = session_info()
@@ -287,7 +335,8 @@ def invoke(client, arguments: dict):
     try:
         _record("request", arguments=arguments)
         started = monotonic()
-        response = client.chat.completions.create(**arguments)
+        with client.chat.completions.create(**arguments) as stream:
+            response = _stream_completion(stream)
         elapsed = monotonic() - started
         # Preserve the SDK envelope and untouched message content before any JSON repair.
         raw = response.model_dump(mode="json")
