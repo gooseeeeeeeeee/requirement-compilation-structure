@@ -117,6 +117,27 @@ class RealDatabaseRuntime(unittest.TestCase):
         (output / 'node_modules').symlink_to(self.modules, target_is_directory=True)
         return output, arc
 
+    def test_stored_generated_column_survives_initialization_and_restart_checks(self):
+        sql = '''CREATE TABLE IF NOT EXISTS "Note" (
+            "id" INTEGER PRIMARY KEY,
+            "tags" TEXT GENERATED ALWAYS AS ('[]') STORED
+        );'''
+        with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            output, _ = self.workspace(directory, sql)
+            result = DatabaseChecks(output, schema()).run()
+            self.assertEqual(result['returncode'], 0, result)
+            self.assertIn('server restart', result['completed'])
+            self.assertIn('output database initialization', result['completed'])
+
+    def test_actual_missing_column_is_still_rejected(self):
+        with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            output, _ = self.workspace(directory,
+                'CREATE TABLE IF NOT EXISTS "Note" ("id" INTEGER PRIMARY KEY);')
+            result = DatabaseChecks(output, schema()).run()
+            self.assertNotEqual(result['returncode'], 0)
+            self.assertEqual(result['phase'], 'fresh initialization')
+            self.assertIn('Missing column: Note.tags', result['error'])
+
     def test_real_initialization_repeat_missing_table_and_compiled_server_restart(self):
         with TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             output, arc = self.workspace(directory)

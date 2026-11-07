@@ -26,7 +26,7 @@ function inspect(filename, marker = false) {
   const db = new Database(filename);
   try {
     for (const [table, fields] of Object.entries(plan.tables)) {
-      const columns = db.prepare(`PRAGMA table_info(${quote(table)})`).all().map(row => row.name);
+      const columns = db.prepare(`PRAGMA table_xinfo(${quote(table)})`).all().map(row => row.name);
       if (!columns.length) throw new Error("Missing table: " + table);
       for (const field of fields) if (!columns.includes(field)) throw new Error("Missing column: " + table + "." + field);
     }
